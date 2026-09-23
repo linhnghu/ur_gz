@@ -159,7 +159,7 @@ ros2 control list_controllers
 
 ## 9. Troubleshooting
 
-### `Package '<package_name>' not found`
+### `Package '<ur3_draw_letter>' not found`
 
 Make sure the workspace has been built and sourced:
 
@@ -172,7 +172,7 @@ source install/setup.bash
 Check whether the package exists:
 
 ```bash
-ros2 pkg list | grep <package_name>
+ros2 pkg list | grep <ur3_draw_letter>
 ```
 
 ---
