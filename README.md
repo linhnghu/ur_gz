@@ -76,7 +76,7 @@ rosdep update
 From the workspace root:
 
 ```bash
-cd ~/ros2_ws
+cd ~/workspaces/ur_gz
 colcon build --symlink-install
 ```
 
@@ -113,31 +113,8 @@ ros2 launch
 Then run the project's launch file from the `launch/` directory:
 
 ```bash
-ros2 launch <package_name> <launch_file>.launch.py
+ros2 launch ur3_draw_letter draw_letter.launch.py
 ```
-
-Replace `<package_name>` and `<launch_file>` with the package and launch file contained in this repository.
-
----
-
-## 6. Run the letter drawing program
-
-After starting the robot simulation and MoveIt 2, open another terminal:
-
-```bash
-source /opt/ros/$ROS_DISTRO/setup.bash
-source ~/ros2_ws/install/setup.bash
-```
-
-Run the drawing node:
-
-```bash
-ros2 run <package_name> <node_name>
-```
-
-The program generates Cartesian motion for the UR3/UR3e end-effector to draw the predefined letter trajectory.
-
----
 
 ## 7. Typical workflow
 
@@ -189,23 +166,6 @@ ros2 topic list
 ros2 control list_controllers
 ```
 
-### Check available packages
-
-```bash
-ros2 pkg list | grep ur
-```
-
-### Rebuild the workspace
-
-```bash
-cd ~/ros2_ws
-rm -rf build install log
-colcon build --symlink-install
-source install/setup.bash
-```
-
----
-
 ## 9. Troubleshooting
 
 ### `Package '<package_name>' not found`
@@ -231,7 +191,7 @@ ros2 pkg list | grep <package_name>
 Check the installed package:
 
 ```bash
-ros2 pkg prefix <package_name>
+ros2 pkg prefix ur3_draw_letter
 ```
 
 Then verify that the launch file exists in the package.
