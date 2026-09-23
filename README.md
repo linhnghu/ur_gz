@@ -22,8 +22,8 @@ The exact ROS 2 distribution should match the versions of the Universal Robots a
 Create a ROS 2 workspace:
 
 ```bash
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws/src
+mkdir -p ~/workspaces
+cd ~/workspaces
 ```
 
 Clone the repository:
@@ -31,15 +31,6 @@ Clone the repository:
 ```bash
 git clone https://github.com/linhnghu/ur_gz.git
 ```
-
-Return to the workspace:
-
-```bash
-cd ~/ros2_ws
-```
-
----
-
 ## 3. Install dependencies
 
 Source ROS 2 first:
