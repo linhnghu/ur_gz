@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -7,11 +9,18 @@
 
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/point.hpp>
-
 #include <visualization_msgs/msg/marker.hpp>
 
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/robot_model/robot_model.h>
+#include <moveit/robot_state/robot_state.h>
+#include <moveit/robot_trajectory/robot_trajectory.h>
+#include <moveit/trajectory_processing/iterative_time_parameterization.h>
+
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+
+#include <Eigen/Geometry>
+
 
 using namespace std::chrono_literals;
 
@@ -20,864 +29,1148 @@ class DrawLetter
 {
 public:
 
-  // ============================================================
-  // Constructor
-  // ============================================================
-
-  explicit DrawLetter(
-    const rclcpp::Node::SharedPtr& node)
-  : node_(node)
-  {
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "=========================================="
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "        UR3e DRAW LETTER NODE"
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "=========================================="
-    );
-
-
-    // ==========================================================
-    // Publisher for RViz LINE_STRIP
-    // ==========================================================
-
-    marker_pub_ =
-      node_->create_publisher<
-        visualization_msgs::msg::Marker
-      >(
-        "/letter_path",
-        10
-      );
-
-
-    // ==========================================================
-    // Create MoveGroupInterface
-    // ==========================================================
-
-    move_group_ =
-      std::make_shared<
-        moveit::planning_interface::MoveGroupInterface
-      >(
-        node_,
-        "ur_manipulator"
-      );
-
-
-    // ==========================================================
-    // MoveIt configuration
-    // ==========================================================
-
-    move_group_->setPlanningTime(10.0);
-
-    move_group_->setNumPlanningAttempts(10);
-
-    move_group_->setMaxVelocityScalingFactor(0.15);
-
-    move_group_->setMaxAccelerationScalingFactor(0.15);
-
-    move_group_->setPoseReferenceFrame("world");
-
-    move_group_->setEndEffectorLink("tool0");
-
-
-    // ==========================================================
-    // Print MoveIt information
-    // ==========================================================
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Planning frame: %s",
-      move_group_->getPlanningFrame().c_str()
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "End effector: %s",
-      move_group_->getEndEffectorLink().c_str()
-    );
-
-
-    // ==========================================================
-    // Start current state monitor
-    // ==========================================================
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Waiting for current robot state..."
-    );
-
-    if (!move_group_->startStateMonitor(5.0))
+    explicit DrawLetter(
+        const rclcpp::Node::SharedPtr& node)
+        : node_(node)
     {
-      RCLCPP_WARN(
-        node_->get_logger(),
-        "Could not start current state monitor."
-      );
-    }
+        // ============================================================
+        // MoveIt
+        // ============================================================
 
-    std::this_thread::sleep_for(2s);
+        move_group_ =
+            std::make_shared<
+                moveit::planning_interface::MoveGroupInterface>(
+                    node_,
+                    "ur_manipulator");
 
+        move_group_->setPlanningTime(10.0);
+        move_group_->setNumPlanningAttempts(10);
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "MoveGroupInterface initialized."
-    );
+        move_group_->setMaxVelocityScalingFactor(0.05);
+        move_group_->setMaxAccelerationScalingFactor(0.05);
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "RViz marker publisher: /letter_path"
-    );
-  }
+        move_group_->setPoseReferenceFrame("world");
+        move_group_->setEndEffectorLink("tool0");
 
-
-  // ============================================================
-  // Create downward tool orientation
-  // ============================================================
-
-  geometry_msgs::msg::Quaternion downwardOrientation()
-  {
-    geometry_msgs::msg::Quaternion q;
-
-    /*
-     * 180-degree rotation around X axis.
-     *
-     * x = 1
-     * y = 0
-     * z = 0
-     * w = 0
-     */
-
-    q.x = 1.0;
-    q.y = 0.0;
-    q.z = 0.0;
-    q.w = 0.0;
-
-    return q;
-  }
+        if (!move_group_->startStateMonitor(10.0))
+        {
+            RCLCPP_WARN(node_->get_logger(), "Could not start current state monitor");
+        }
 
 
-  // ============================================================
-  // Create Cartesian pose
-  // ============================================================
+        // ============================================================
+        // Publisher
+        // ============================================================
 
-  geometry_msgs::msg::Pose createPose(
-    double x,
-    double y,
-    double z)
-  {
-    geometry_msgs::msg::Pose pose;
+        letter_marker_pub_ =
+            node_->create_publisher<
+                visualization_msgs::msg::Marker>(
+                    "/letter_path",
+                    10);
 
-    pose.position.x = x;
-    pose.position.y = y;
-    pose.position.z = z;
-
-    pose.orientation =
-      downwardOrientation();
-
-    return pose;
-  }
+        eef_marker_pub_ =
+            node_->create_publisher<
+                visualization_msgs::msg::Marker>(
+                    "/eef_trajectory",
+                    10);
 
 
-  // ============================================================
-  // Publish LINE_STRIP to RViz
-  // ============================================================
+        // ============================================================
+        // Timer publish Marker liên tục
+        //
+        // 10 Hz
+        // ============================================================
 
-  void publishLetterPath(
-    const std::vector<geometry_msgs::msg::Pose>& waypoints)
-  {
-    visualization_msgs::msg::Marker marker;
-
-
-    // ==========================================================
-    // Header
-    // ==========================================================
-
-    marker.header.frame_id = "world";
-
-    marker.header.stamp =
-      node_->now();
+        marker_timer_ =
+            node_->create_wall_timer(
+                std::chrono::milliseconds(100),
+                [this]()
+                {
+                    publishMarkers();
+                });
 
 
-    // ==========================================================
-    // Marker identification
-    // ==========================================================
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "========================================");
 
-    marker.ns = "letter";
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "DrawLetter initialized");
 
-    marker.id = 0;
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Planning frame: %s",
+            move_group_->getPlanningFrame().c_str());
 
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "EEF link: %s",
+            move_group_->getEndEffectorLink().c_str());
 
-    // ==========================================================
-    // LINE_STRIP
-    // ==========================================================
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Publish topics:");
 
-    marker.type =
-      visualization_msgs::msg::Marker::LINE_STRIP;
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "  /letter_path");
 
-    marker.action =
-      visualization_msgs::msg::Marker::ADD;
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "  /eef_trajectory");
 
-
-    // ==========================================================
-    // Line thickness
-    // ==========================================================
-
-    marker.scale.x = 0.008;
-
-
-    // ==========================================================
-    // Marker lifetime
-    //
-    // 0 = keep marker permanently
-    // ==========================================================
-
-    marker.lifetime =
-      rclcpp::Duration::from_seconds(0.0);
-
-
-    // ==========================================================
-    // Add points
-    // ==========================================================
-
-    for (const auto& pose : waypoints)
-    {
-      geometry_msgs::msg::Point point;
-
-      point.x = pose.position.x;
-      point.y = pose.position.y;
-      point.z = pose.position.z;
-
-      marker.points.push_back(point);
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "========================================");
     }
 
 
-    // ==========================================================
-    // Publish
-    // ==========================================================
+    // ================================================================
+    // Publish Marker định kỳ
+    // ================================================================
 
-    marker_pub_->publish(marker);
-
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Published %zu points to /letter_path",
-      marker.points.size()
-    );
-  }
-
-
-  // ============================================================
-  // Move to single Cartesian pose
-  // ============================================================
-
-  bool moveToPose(
-    const geometry_msgs::msg::Pose& target)
-  {
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "------------------------------------------"
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Planning to target:"
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "  x = %.3f m",
-      target.position.x
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "  y = %.3f m",
-      target.position.y
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "  z = %.3f m",
-      target.position.z
-    );
-
-
-    // ==========================================================
-    // Use current state as start state
-    // ==========================================================
-
-    move_group_->setStartStateToCurrentState();
-
-
-    // ==========================================================
-    // Set target
-    // ==========================================================
-
-    move_group_->setPoseTarget(target);
-
-
-    // ==========================================================
-    // Plan
-    // ==========================================================
-
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-
-    auto plan_result =
-      move_group_->plan(plan);
-
-
-    if (
-      plan_result !=
-      moveit::core::MoveItErrorCode::SUCCESS)
+    void publishMarkers()
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Planning to target FAILED."
-      );
+        // ------------------------------------------------------------
+        // Letter path
+        // ------------------------------------------------------------
 
-      move_group_->clearPoseTargets();
+        if (!letter_marker_.points.empty())
+        {
+            letter_marker_.header.stamp =
+                node_->now();
 
-      return false;
+            letter_marker_pub_->publish(
+                letter_marker_);
+        }
+
+
+        // ------------------------------------------------------------
+        // EEF trajectory
+        // ------------------------------------------------------------
+
+        if (!eef_marker_.points.empty())
+        {
+            eef_marker_.header.stamp =
+                node_->now();
+
+            eef_marker_pub_->publish(
+                eef_marker_);
+        }
     }
 
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Planning successful."
-    );
+    // ================================================================
+    // Orientation tool hướng xuống
+    // ================================================================
 
-
-    // ==========================================================
-    // Execute
-    // ==========================================================
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Executing trajectory..."
-    );
-
-    auto execute_result =
-      move_group_->execute(plan);
-
-
-    move_group_->clearPoseTargets();
-
-
-    if (
-      execute_result !=
-      moveit::core::MoveItErrorCode::SUCCESS)
+    geometry_msgs::msg::Quaternion downwardOrientation()
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Trajectory execution FAILED."
-      );
-
-      return false;
+        return move_group_->getCurrentPose("tool0").pose.orientation;
     }
 
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Trajectory execution successful."
-    );
+    // ================================================================
+    // Create Pose
+    // ================================================================
 
-    return true;
-  }
-
-
-  // ============================================================
-  // Cartesian motion
-  // ============================================================
-
-  bool cartesianMove(
-    const std::vector<geometry_msgs::msg::Pose>& waypoints)
-  {
-    if (waypoints.size() < 2)
+    geometry_msgs::msg::Pose createPose(
+        double x,
+        double y,
+        double z)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Cartesian path requires at least 2 waypoints."
-      );
+        geometry_msgs::msg::Pose pose;
 
-      return false;
+        pose.position.x = x;
+        pose.position.y = y;
+        pose.position.z = z;
+
+        pose.orientation =
+            downwardOrientation();
+
+        return pose;
     }
 
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "------------------------------------------"
-    );
+    // ================================================================
+    // Tạo Marker đường chữ L lý tưởng
+    // ================================================================
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Computing Cartesian path..."
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Number of waypoints: %zu",
-      waypoints.size()
-    );
-
-
-    // ==========================================================
-    // Cartesian interpolation
-    // ==========================================================
-
-    const double eef_step = 0.005;
-
-    const double jump_threshold = 0.0;
-
-
-    // ==========================================================
-    // Robot trajectory
-    // ==========================================================
-
-    moveit_msgs::msg::RobotTrajectory trajectory;
-
-
-    // ==========================================================
-    // Compute Cartesian path
-    // ==========================================================
-
-    const double fraction =
-      move_group_->computeCartesianPath(
-        waypoints,
-        eef_step,
-        jump_threshold,
-        trajectory,
-        true
-      );
-
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Cartesian path: %.2f%% achieved",
-      fraction * 100.0
-    );
-
-
-    // ==========================================================
-    // Check Cartesian path
-    // ==========================================================
-
-    if (fraction < 0.99)
+    void publishLetterPath(
+        const std::vector<
+            geometry_msgs::msg::Pose>& path)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Cartesian path incomplete."
-      );
+        visualization_msgs::msg::Marker marker;
 
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Only %.2f%% achieved.",
-        fraction * 100.0
-      );
+        marker.header.frame_id =
+            move_group_->getPlanningFrame();
 
-      return false;
+        marker.header.stamp =
+            node_->now();
+
+        marker.ns =
+            "letter_path";
+
+        marker.id = 0;
+
+        marker.type =
+            visualization_msgs::msg::Marker::LINE_STRIP;
+
+        marker.action =
+            visualization_msgs::msg::Marker::ADD;
+
+
+        // ============================================================
+        // Marker không tự biến mất
+        // ============================================================
+
+        marker.lifetime =
+            rclcpp::Duration::from_seconds(0);
+
+
+        // ============================================================
+        // Độ dày
+        // ============================================================
+
+        marker.scale.x = 0.01;
+
+
+        // ============================================================
+        // Màu đỏ
+        // ============================================================
+
+        marker.color.r = 1.0;
+        marker.color.g = 0.0;
+        marker.color.b = 0.0;
+        marker.color.a = 1.0;
+
+
+        // ============================================================
+        // Orientation marker
+        // ============================================================
+
+        marker.pose.orientation.w = 1.0;
+
+
+        // ============================================================
+        // Points
+        // ============================================================
+
+        for (const auto& pose : path)
+        {
+            geometry_msgs::msg::Point point;
+
+            point.x =
+                pose.position.x;
+
+            point.y =
+                pose.position.y;
+
+            point.z =
+                pose.position.z;
+
+            marker.points.push_back(point);
+        }
+
+
+        // ============================================================
+        // Lưu Marker lại
+        //
+        // Không publish một lần duy nhất nữa.
+        // Timer sẽ publish liên tục.
+        // ============================================================
+
+        letter_marker_ = marker;
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Letter marker created: %zu points",
+            letter_marker_.points.size());
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Letter frame: %s",
+            letter_marker_.header.frame_id.c_str());
     }
 
 
-    // ==========================================================
-    // Convert trajectory to MoveGroup plan
-    // ==========================================================
+    // ================================================================
+    // Lấy đường đi EEF từ RobotTrajectory
+    // ================================================================
 
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-
-    plan.trajectory_ = trajectory;
-
-
-    // ==========================================================
-    // Execute
-    // ==========================================================
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Executing Cartesian trajectory..."
-    );
-
-    auto result =
-      move_group_->execute(plan);
-
-
-    if (
-      result !=
-      moveit::core::MoveItErrorCode::SUCCESS)
+    void publishActualEEFPath(
+        const moveit_msgs::msg::RobotTrajectory& trajectory)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Cartesian trajectory execution FAILED."
-      );
+        auto robot_model =
+            move_group_->getRobotModel();
 
-      return false;
+
+        if (!robot_model)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Robot model is null");
+
+            return;
+        }
+
+
+        // ============================================================
+        // RobotState
+        // ============================================================
+
+        moveit::core::RobotState robot_state(
+            robot_model);
+
+        robot_state.setToDefaultValues();
+
+
+        // ============================================================
+        // tool0
+        // ============================================================
+
+        const moveit::core::LinkModel* link_model =
+            robot_model->getLinkModel("tool0");
+
+
+        if (!link_model)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Cannot find tool0");
+
+            return;
+        }
+
+
+        const auto& joint_names =
+            trajectory.joint_trajectory.joint_names;
+
+        const auto& points =
+            trajectory.joint_trajectory.points;
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Trajectory has %zu points",
+            points.size());
+
+
+        // ============================================================
+        // Duyệt trajectory
+        // ============================================================
+
+        for (const auto& trajectory_point : points)
+        {
+            if (trajectory_point.positions.size()
+                != joint_names.size())
+            {
+                RCLCPP_WARN(
+                    node_->get_logger(),
+                    "Joint position size mismatch");
+
+                continue;
+            }
+
+
+            // --------------------------------------------------------
+            // Set joint positions
+            // --------------------------------------------------------
+
+            for (size_t i = 0;
+                 i < joint_names.size();
+                 ++i)
+            {
+                robot_state.setVariablePosition(
+                    joint_names[i],
+                    trajectory_point.positions[i]);
+            }
+
+
+            // --------------------------------------------------------
+            // Forward kinematics
+            // --------------------------------------------------------
+
+            robot_state.update();
+
+
+            // --------------------------------------------------------
+            // tool0 transform
+            // --------------------------------------------------------
+
+            const Eigen::Isometry3d&
+                transform =
+                    robot_state.getGlobalLinkTransform(
+                        link_model);
+
+
+            // --------------------------------------------------------
+            // XYZ
+            // --------------------------------------------------------
+
+            geometry_msgs::msg::Point point;
+
+            point.x =
+                transform.translation().x();
+
+            point.y =
+                transform.translation().y();
+
+            point.z =
+                transform.translation().z();
+
+
+            // --------------------------------------------------------
+            // Lưu vào EEF path
+            // --------------------------------------------------------
+
+            eef_path_.push_back(point);
+        }
+
+
+        // ============================================================
+        // Tạo Marker
+        // ============================================================
+
+        visualization_msgs::msg::Marker marker;
+
+        marker.header.frame_id =
+            move_group_->getPlanningFrame();
+
+        marker.header.stamp =
+            node_->now();
+
+        marker.ns =
+            "eef_trajectory";
+
+        marker.id = 0;
+
+        marker.type =
+            visualization_msgs::msg::Marker::LINE_STRIP;
+
+        marker.action =
+            visualization_msgs::msg::Marker::ADD;
+
+
+        // ============================================================
+        // Không tự biến mất
+        // ============================================================
+
+        marker.lifetime =
+            rclcpp::Duration::from_seconds(0);
+
+
+        // ============================================================
+        // Độ dày
+        // ============================================================
+
+        marker.scale.x = 0.005;
+
+
+        // ============================================================
+        // Màu xanh lá
+        // ============================================================
+
+        marker.color.r = 0.0;
+        marker.color.g = 1.0;
+        marker.color.b = 0.0;
+        marker.color.a = 1.0;
+
+
+        // ============================================================
+        // Orientation
+        // ============================================================
+
+        marker.pose.orientation.w = 1.0;
+
+
+        // ============================================================
+        // Toàn bộ EEF path
+        // ============================================================
+
+        marker.points =
+            eef_path_;
+
+
+        // ============================================================
+        // Lưu Marker
+        //
+        // Timer sẽ publish liên tục.
+        // ============================================================
+
+        eef_marker_ = marker;
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "EEF marker created: %zu points",
+            eef_marker_.points.size());
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "EEF frame: %s",
+            eef_marker_.header.frame_id.c_str());
     }
 
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Cartesian trajectory executed successfully."
-    );
+    // ================================================================
+    // Retime trajectory for the low-gain Gazebo position interface.
+    // ================================================================
 
-
-    return true;
-  }
-
-
-  // ============================================================
-  // Draw letter L
-  // ============================================================
-
-  bool drawLetterL()
-  {
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "=========================================="
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "            DRAWING LETTER L"
-    );
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "==========================================");
-
-
-    /*
-     *
-     *                  P1
-     *                  |
-     *                  |
-     *                  |
-     *                  |
-     *                  |
-     *                  P2 -------- P3
-     *
-     *
-     * P1 = (0.35,  0.15, 0.25)
-     * P2 = (0.35, -0.15, 0.25)
-     * P3 = (0.50, -0.15, 0.25)
-     *
-     */
-
-
-    // ==========================================================
-    // Define points
-    // ==========================================================
-
-    geometry_msgs::msg::Pose p1 =
-      createPose(
-        0.35,
-        0.15,
-        0.25
-      );
-
-
-    geometry_msgs::msg::Pose p2 =
-      createPose(
-        0.35,
-        -0.15,
-        0.25
-      );
-
-
-    geometry_msgs::msg::Pose p3 =
-      createPose(
-        0.50,
-        -0.15,
-        0.25
-      );
-
-
-    // ==========================================================
-    // Publish letter shape to RViz
-    // ==========================================================
-
-    std::vector<
-      geometry_msgs::msg::Pose
-    > letter_path;
-
-    letter_path.push_back(p1);
-    letter_path.push_back(p2);
-    letter_path.push_back(p3);
-
-
-    publishLetterPath(letter_path);
-
-
-    // ==========================================================
-    // STEP 1
-    // Move to P1
-    // ==========================================================
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "STEP 1: Moving to P1..."
-    );
-
-
-    if (!moveToPose(p1))
+    bool retimeTrajectory(
+        moveit_msgs::msg::RobotTrajectory& trajectory)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Cannot reach P1."
-      );
+        auto current_state = move_group_->getCurrentState(5.0);
+        auto robot_model = move_group_->getRobotModel();
 
-      return false;
+        if (!current_state || !robot_model)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Cannot retime trajectory without current robot state");
+            return false;
+        }
+
+        robot_trajectory::RobotTrajectory robot_trajectory(
+            robot_model,
+            "ur_manipulator");
+        robot_trajectory.setRobotTrajectoryMsg(
+            *current_state,
+            trajectory);
+
+        trajectory_processing::IterativeParabolicTimeParameterization time_parameterization;
+        if (!time_parameterization.computeTimeStamps(
+                robot_trajectory,
+                0.03,
+                0.03))
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Could not retime trajectory");
+            return false;
+        }
+
+        robot_trajectory.getRobotTrajectoryMsg(trajectory);
+        return true;
     }
 
 
-    // ==========================================================
-    // STEP 2
-    // Draw P1 -> P2
-    // ==========================================================
+    // ================================================================
+    // Move tới Pose
+    // ================================================================
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "STEP 2: Drawing vertical stroke P1 -> P2..."
-    );
-
-
-    std::vector<
-      geometry_msgs::msg::Pose
-    > vertical_stroke;
-
-
-    vertical_stroke.push_back(p1);
-    vertical_stroke.push_back(p2);
-
-
-    if (!cartesianMove(vertical_stroke))
+    bool moveToPose(
+        const geometry_msgs::msg::Pose& target_pose)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Failed to draw P1 -> P2."
-      );
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Move to: x=%.3f y=%.3f z=%.3f",
+            target_pose.position.x,
+            target_pose.position.y,
+            target_pose.position.z);
 
-      return false;
+
+        move_group_->setStartStateToCurrentState();
+
+        move_group_->setPoseTarget(
+            target_pose);
+
+
+
+        moveit::planning_interface::
+            MoveGroupInterface::Plan plan;
+
+
+        auto result =
+            move_group_->plan(plan);
+
+        move_group_->clearPoseTargets();
+
+        if (result == moveit::core::MoveItErrorCode::SUCCESS &&
+            !retimeTrajectory(plan.trajectory_))
+        {
+            return false;
+        }
+
+
+        if (result !=
+            moveit::core::MoveItErrorCode::SUCCESS)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Planning failed");
+
+            return false;
+        }
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Planning successful");
+
+
+        auto execute_result =
+            move_group_->execute(plan);
+
+
+        if (execute_result !=
+            moveit::core::MoveItErrorCode::SUCCESS)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Execution failed");
+
+            return false;
+        }
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Execution successful");
+
+
+        return true;
     }
 
 
-    // ==========================================================
-    // STEP 3
-    // Draw P2 -> P3
-    // ==========================================================
+    // ================================================================
+    // Cartesian Move
+    // ================================================================
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "STEP 3: Drawing horizontal stroke P2 -> P3..."
-    );
-
-
-    std::vector<
-      geometry_msgs::msg::Pose
-    > horizontal_stroke;
-
-
-    horizontal_stroke.push_back(p2);
-    horizontal_stroke.push_back(p3);
-
-
-    if (!cartesianMove(horizontal_stroke))
+    bool cartesianMove(
+        const std::vector<
+            geometry_msgs::msg::Pose>& waypoints)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Failed to draw P2 -> P3."
-      );
+        if (waypoints.empty())
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Waypoints are empty");
 
-      return false;
+            return false;
+        }
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Computing Cartesian path: %zu waypoints",
+            waypoints.size());
+
+        auto current_state = move_group_->getCurrentState(5.0);
+        if (!current_state)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Could not obtain current robot state for Cartesian path");
+            return false;
+        }
+        move_group_->setStartState(*current_state);
+
+
+        moveit_msgs::msg::RobotTrajectory trajectory;
+
+
+        // ============================================================
+        // Cartesian path
+        //
+        // eef_step = 5 mm
+        // jump_threshold = 0
+        // ============================================================
+
+        double fraction =
+            move_group_->computeCartesianPath(
+                waypoints,
+                0.005,
+                0.0,
+                trajectory,
+                true);
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Cartesian fraction: %.2f%%",
+            fraction * 100.0);
+
+
+        if (fraction < 0.99)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Cartesian path incomplete");
+
+            return false;
+        }
+
+
+        // ============================================================
+        // Plan
+        // ============================================================
+
+        moveit::planning_interface::
+            MoveGroupInterface::Plan plan;
+
+        plan.trajectory_ =
+            trajectory;
+
+        if (!retimeTrajectory(plan.trajectory_))
+        {
+            return false;
+        }
+
+
+        // ============================================================
+        // Execute
+        // ============================================================
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Executing Cartesian trajectory...");
+
+
+        auto result =
+            move_group_->execute(plan);
+
+
+        if (result !=
+            moveit::core::MoveItErrorCode::SUCCESS)
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "Cartesian execution failed");
+
+            return false;
+        }
+
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Cartesian execution successful");
+
+
+        // ============================================================
+        // Lấy EEF path
+        // ============================================================
+
+        publishActualEEFPath(
+            trajectory);
+
+
+        return true;
     }
 
 
-    // ==========================================================
-    // STEP 4
-    // Lift tool
-    // ==========================================================
+    // ================================================================
+    // Execute a long Cartesian stroke as short segments.
+    // This keeps the IK solution continuous near workspace boundaries.
+    // ================================================================
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "STEP 4: Lifting tool..."
-    );
-
-
-    geometry_msgs::msg::Pose p3_lift = p3;
-
-    p3_lift.position.z += 0.08;
-
-
-    std::vector<
-      geometry_msgs::msg::Pose
-    > lift_path;
-
-
-    lift_path.push_back(p3);
-    lift_path.push_back(p3_lift);
-
-
-    if (!cartesianMove(lift_path))
+    bool cartesianMoveSegmented(
+        const geometry_msgs::msg::Pose& start,
+        const geometry_msgs::msg::Pose& target)
     {
-      RCLCPP_ERROR(
-        node_->get_logger(),
-        "Failed to lift tool."
-      );
+        const double dx = target.position.x - start.position.x;
+        const double dy = target.position.y - start.position.y;
+        const double dz = target.position.z - start.position.z;
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const int steps = std::max(1, static_cast<int>(std::ceil(distance / 0.01)));
 
-      return false;
+        for (int i = 1; i <= steps; ++i)
+        {
+            const double t = static_cast<double>(i) / static_cast<double>(steps);
+            geometry_msgs::msg::Pose waypoint = start;
+            waypoint.position.x = start.position.x + t * dx;
+            waypoint.position.y = start.position.y + t * dy;
+            waypoint.position.z = start.position.z + t * dz;
+            waypoint.orientation = start.orientation;
+
+            if (!cartesianMove({waypoint}))
+            {
+                RCLCPP_ERROR(
+                    node_->get_logger(),
+                    "Cartesian segment %d/%d failed",
+                    i,
+                    steps);
+                return false;
+            }
+
+            std::this_thread::sleep_for(100ms);
+        }
+
+        return true;
     }
 
 
-    // ==========================================================
-    // Finished
-    // ==========================================================
+    // ================================================================
+    // Vẽ chữ L
+    // ================================================================
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "=========================================="
-    );
+    void drawLetterL()
+    {
+        RCLCPP_INFO(
+            node_->get_logger(),
+            " ");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "========================================");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "START DRAWING LETTER L");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "========================================");
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "        LETTER L COMPLETED"
-    );
 
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "==========================================");
+        // ============================================================
+        // Xóa EEF trajectory cũ
+        // ============================================================
+
+        eef_path_.clear();
+
+        eef_marker_.points.clear();
 
 
-    return true;
-  }
+        // ============================================================
+        // P1
+        // ============================================================
+
+        geometry_msgs::msg::Pose P1 =
+            move_group_->getCurrentPose("tool0").pose;
+        P1.orientation = downwardOrientation();
+
+        const double x0 = P1.position.x;
+        const double y0 = P1.position.y;
+        const double z0 = P1.position.z;
+
+
+        // ============================================================
+        // P2
+        // ============================================================
+
+        geometry_msgs::msg::Pose P2 =
+            createPose(x0 + 0.06, y0, z0);
+        P2.orientation = P1.orientation;
+
+
+        // ============================================================
+        // P3
+        // ============================================================
+
+        geometry_msgs::msg::Pose P3 =
+            createPose(x0 + 0.06, y0 - 0.05, z0);
+        P3.orientation = P1.orientation;
+
+
+        // ============================================================
+        // P4 - nhấc tool
+        // ============================================================
+
+        geometry_msgs::msg::Pose P4 =
+            createPose(x0 + 0.06, y0 - 0.05, z0 + 0.02);
+        P4.orientation = P1.orientation;
+
+
+        // ============================================================
+        // Ideal letter path
+        // ============================================================
+
+        std::vector<
+            geometry_msgs::msg::Pose>
+            letter_path;
+
+        letter_path.push_back(P1);
+        letter_path.push_back(P2);
+        letter_path.push_back(P3);
+
+
+        publishLetterPath(
+            letter_path);
+
+
+        // P1 is captured from the current tool pose.  Starting the
+        // Cartesian path directly avoids asking MoveIt for a new IK branch
+        // for a pose that is already reached.
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Starting Cartesian drawing from the current tool pose");
+
+
+        // ============================================================
+        // P1 -> P2
+        // ============================================================
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Drawing P1 -> P2");
+
+
+        std::vector<
+            geometry_msgs::msg::Pose>
+            path_P1_P2;
+
+        path_P1_P2.push_back(P2);
+
+
+        if (!cartesianMoveSegmented(P1, P2))
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "P1 -> P2 failed");
+
+            return;
+        }
+
+
+        // ============================================================
+        // P2 -> P3
+        // ============================================================
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Drawing P2 -> P3");
+
+
+        std::vector<
+            geometry_msgs::msg::Pose>
+            path_P2_P3;
+
+        path_P2_P3.push_back(P3);
+
+
+        if (!cartesianMoveSegmented(P2, P3))
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "P2 -> P3 failed");
+
+            return;
+        }
+
+
+        // ============================================================
+        // P3 -> P4
+        // ============================================================
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Lifting P3 -> P4");
+
+
+        std::vector<
+            geometry_msgs::msg::Pose>
+            path_P3_P4;
+
+        path_P3_P4.push_back(P4);
+
+
+        if (!cartesianMoveSegmented(P3, P4))
+        {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "P3 -> P4 failed");
+
+            return;
+        }
+
+
+        // ============================================================
+        // DONE
+        // ============================================================
+
+        RCLCPP_INFO(
+            node_->get_logger(),
+            " ");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "========================================");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "LETTER L DRAWING FINISHED");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "EEF points: %zu",
+            eef_path_.size());
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Markers are continuously published.");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "RViz can display them at any time.");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Press Ctrl+C to exit.");
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "========================================");
+    }
 
 
 private:
 
-  // ============================================================
-  // ROS node
-  // ============================================================
+    // ================================================================
+    // ROS Node
+    // ================================================================
 
-  rclcpp::Node::SharedPtr node_;
-
-
-  // ============================================================
-  // MoveIt
-  // ============================================================
-
-  std::shared_ptr<
-    moveit::planning_interface::MoveGroupInterface
-  > move_group_;
+    rclcpp::Node::SharedPtr node_;
 
 
-  // ============================================================
-  // RViz marker publisher
-  // ============================================================
+    // ================================================================
+    // MoveIt
+    // ================================================================
 
-  rclcpp::Publisher<
+    std::shared_ptr<
+        moveit::planning_interface::
+        MoveGroupInterface>
+        move_group_;
+
+
+    // ================================================================
+    // Publishers
+    // ================================================================
+
+    rclcpp::Publisher<
+        visualization_msgs::msg::Marker>::SharedPtr
+        letter_marker_pub_;
+
+    rclcpp::Publisher<
+        visualization_msgs::msg::Marker>::SharedPtr
+        eef_marker_pub_;
+
+
+    // ================================================================
+    // Timer
+    // ================================================================
+
+    rclcpp::TimerBase::SharedPtr
+        marker_timer_;
+
+
+    // ================================================================
+    // Marker được lưu lại
+    // ================================================================
+
     visualization_msgs::msg::Marker
-  >::SharedPtr marker_pub_;
+        letter_marker_;
+
+    visualization_msgs::msg::Marker
+        eef_marker_;
+
+
+    // ================================================================
+    // EEF trajectory
+    // ================================================================
+
+    std::vector<
+        geometry_msgs::msg::Point>
+        eef_path_;
 };
 
 
-// =================================================================
+// ====================================================================
 // MAIN
-// =================================================================
+// ====================================================================
 
 int main(
-  int argc,
-  char** argv)
+    int argc,
+    char* argv[])
 {
-  rclcpp::init(
-    argc,
-    argv
-  );
+    rclcpp::init(
+        argc,
+        argv);
 
 
-  // ==============================================================
-  // Node options
-  //
-  // Allows robot_description_kinematics from launch file
-  // ==============================================================
+    // ================================================================
+    // Node
+    // ================================================================
 
-  auto node =
-    rclcpp::Node::make_shared(
-      "draw_letter",
-
-      rclcpp::NodeOptions()
-        .automatically_declare_parameters_from_overrides(
-          true
-        )
-    );
+    auto node =
+        std::make_shared<rclcpp::Node>(
+            "draw_letter_node",
+            rclcpp::NodeOptions()
+                .automatically_declare_parameters_from_overrides(
+                    true));
 
 
-  try
-  {
-    // ============================================================
-    // Create drawer
-    // ============================================================
+    // ================================================================
+    // DrawLetter
+    // ================================================================
 
-    DrawLetter drawer(node);
-
-
-    std::this_thread::sleep_for(2s);
+    auto draw_letter =
+        std::make_shared<DrawLetter>(
+            node);
 
 
-    // ============================================================
-    // Draw L
-    // ============================================================
+    // ================================================================
+    // Executor
+    // ================================================================
 
-    const bool success =
-      drawer.drawLetterL();
+    rclcpp::executors::
+        SingleThreadedExecutor executor;
+
+    executor.add_node(node);
 
 
-    // ============================================================
-    // Check result
-    // ============================================================
+    // ================================================================
+    // Spin thread
+    // ================================================================
 
-    if (!success)
-    {
-      RCLCPP_ERROR(
-        node->get_logger(),
-        "Drawing failed."
-      );
+    std::thread spinner(
+        [&executor]()
+        {
+            executor.spin();
+        });
 
-      rclcpp::shutdown();
 
-      return 1;
-    }
-
+    // ================================================================
+    // Chờ MoveIt
+    // ================================================================
 
     RCLCPP_INFO(
-      node->get_logger(),
-      "Drawing finished successfully."
-    );
-  }
+        node->get_logger(),
+        "Waiting 2 seconds for MoveIt...");
+
+    std::this_thread::sleep_for(
+        2s);
 
 
-  catch (
-    const std::exception& e)
-  {
-    RCLCPP_FATAL(
-      node->get_logger(),
-      "Exception: %s",
-      e.what()
-    );
+    // ================================================================
+    // Draw
+    // ================================================================
+
+    draw_letter->drawLetterL();
+
+
+    // ================================================================
+    // Giữ node chạy
+    // ================================================================
+
+    RCLCPP_INFO(
+        node->get_logger(),
+        " ");
+    RCLCPP_INFO(
+        node->get_logger(),
+        "Node remains alive.");
+    RCLCPP_INFO(
+        node->get_logger(),
+        "Marker topics are publishing at 10 Hz.");
+    RCLCPP_INFO(
+        node->get_logger(),
+        "Press Ctrl+C to stop.");
+
+
+    // ================================================================
+    // Chờ Ctrl+C
+    // ================================================================
+
+    spinner.join();
+
+
+    // ================================================================
+    // Shutdown
+    // ================================================================
 
     rclcpp::shutdown();
 
-    return 1;
-  }
-
-
-  // ==============================================================
-  // Shutdown
-  // ==============================================================
-
-  rclcpp::shutdown();
-
-  return 0;
+    return 0;
 }
